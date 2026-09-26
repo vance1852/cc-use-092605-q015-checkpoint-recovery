@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -108,23 +108,89 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_open_exclusion_per_observation
 ON exclusion_requests(observation_id)
 WHERE status IN ('pending', 'approved');
 
-CREATE TABLE IF NOT EXISTS analysis_jobs (
-    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+-- 可恢复的批量分析工作图：创建时固定输入清单与算法版本。
+CREATE TABLE IF NOT EXISTS analysis_workflows (
+    workflow_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     batch_revision INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
+    protocol_sha256 TEXT NOT NULL CHECK (length(protocol_sha256) = 64),
+    algorithm_version TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    lease_seconds INTEGER NOT NULL CHECK (lease_seconds > 0),
+    retry_backoff_seconds INTEGER NOT NULL DEFAULT 0 CHECK (retry_backoff_seconds >= 0),
+    state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'cancelled', 'completed')),
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (batch_id, batch_revision, input_sha256, algorithm_version)
+);
+
+-- 每个分片固定自己的输入摘要、所属层级与前置依赖。
+CREATE TABLE IF NOT EXISTS workflow_shards (
+    shard_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_id INTEGER NOT NULL REFERENCES analysis_workflows(workflow_id),
+    shard_key TEXT NOT NULL,
+    layer INTEGER NOT NULL CHECK (layer >= 0),
+    shard_kind TEXT NOT NULL,
+    shard_input_sha256 TEXT NOT NULL CHECK (length(shard_input_sha256) = 64),
+    depends_on_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('waiting', 'ready', 'leased', 'succeeded', 'failed', 'manual')
+    ),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     available_at TEXT NOT NULL,
+    lease_generation INTEGER NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
     lease_owner TEXT,
     lease_expires_at TEXT,
     last_error TEXT,
+    output_id INTEGER REFERENCES shard_outputs(output_id),
+    completed_attempt INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE (batch_id, batch_revision)
+    UNIQUE (workflow_id, shard_key)
 );
 
+-- 内容寻址的分片输出：同输入摘要 + 同算法版本只产生一份校验值。
+CREATE TABLE IF NOT EXISTS shard_outputs (
+    output_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shard_kind TEXT NOT NULL,
+    shard_input_sha256 TEXT NOT NULL CHECK (length(shard_input_sha256) = 64),
+    algorithm_version TEXT NOT NULL,
+    output_sha256 TEXT NOT NULL CHECK (length(output_sha256) = 64),
+    output_json TEXT NOT NULL,
+    produced_by_workflow INTEGER REFERENCES analysis_workflows(workflow_id),
+    created_at TEXT NOT NULL,
+    UNIQUE (shard_input_sha256, algorithm_version)
+);
+
+-- 分片依赖边：只有全部前置分片成功，分片才可被领取。
+CREATE TABLE IF NOT EXISTS shard_dependencies (
+    shard_id INTEGER NOT NULL REFERENCES workflow_shards(shard_id),
+    depends_on_shard_id INTEGER NOT NULL REFERENCES workflow_shards(shard_id),
+    PRIMARY KEY (shard_id, depends_on_shard_id)
+);
+
+-- 每次尝试的流水：等待/运行/失败/人工处理/完成均可据此重建。
+CREATE TABLE IF NOT EXISTS workflow_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_id INTEGER NOT NULL REFERENCES analysis_workflows(workflow_id),
+    shard_id INTEGER NOT NULL REFERENCES workflow_shards(shard_id),
+    attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+    lease_generation INTEGER NOT NULL,
+    worker_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('leased', 'succeeded', 'retry', 'manual', 'lease_expired')),
+    error TEXT,
+    output_id INTEGER REFERENCES shard_outputs(output_id),
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+-- 下游聚合产物与所用分片输出的血缘：每个结果由哪份输入与哪次尝试产生。
 CREATE TABLE IF NOT EXISTS analyses (
     analysis_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_id INTEGER NOT NULL REFERENCES analysis_workflows(workflow_id),
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     batch_revision INTEGER NOT NULL,
     protocol_sha256 TEXT NOT NULL CHECK (length(protocol_sha256) = 64),
@@ -134,7 +200,18 @@ CREATE TABLE IF NOT EXISTS analyses (
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    UNIQUE (batch_id, batch_revision, input_sha256)
+    UNIQUE (workflow_id)
+);
+
+CREATE TABLE IF NOT EXISTS analysis_shard_provenance (
+    analysis_id INTEGER NOT NULL REFERENCES analyses(analysis_id),
+    shard_id INTEGER NOT NULL REFERENCES workflow_shards(shard_id),
+    output_id INTEGER NOT NULL REFERENCES shard_outputs(output_id),
+    attempt_id INTEGER REFERENCES workflow_attempts(attempt_id),
+    shard_input_sha256 TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    reused INTEGER NOT NULL DEFAULT 0 CHECK (reused IN (0, 1)),
+    PRIMARY KEY (analysis_id, shard_id)
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
@@ -157,12 +234,26 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- 工作进程领取分片的热路径：按工作流过滤、可领取状态与到期时间排序。
+CREATE INDEX IF NOT EXISTS idx_shards_claim
+ON workflow_shards(workflow_id, state, available_at);
+
+CREATE INDEX IF NOT EXISTS idx_shards_lease_expiry
+ON workflow_shards(state, lease_expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_attempts_shard
+ON workflow_attempts(shard_id, attempt_number);
+
+CREATE INDEX IF NOT EXISTS idx_provenance_output
+ON analysis_shard_provenance(output_id);
 """
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
-    "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "observations", "idempotency_keys", "exclusion_requests", "analysis_workflows",
+    "workflow_shards", "shard_outputs", "shard_dependencies", "workflow_attempts",
+    "analyses", "analysis_shard_provenance", "decisions", "audit_events",
 })
 
 

@@ -114,18 +114,47 @@ class JsonApplication:
                     self._actor(normalized_headers), int(parts[1]), payload["reason"]
                 )
                 return Response(200, result)
-            if method == "POST" and path == "/jobs/claim":
-                result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
-                return Response(200, {"job": result})
-            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
-                result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+            if method == "POST" and path == "/workflows":
+                result = self.service.create_analysis_workflow(
+                    self._actor(normalized_headers),
+                    payload["batch_id"],
+                    max_attempts=int(payload.get("max_attempts", 3)),
+                    lease_seconds=int(payload.get("lease_seconds", 60)),
+                    retry_backoff_seconds=int(payload.get("retry_backoff_seconds", 5)),
+                )
+                return Response(201, result)
+            if method == "GET" and len(parts) == 2 and parts[0] == "workflows":
+                return Response(200, self.service.get_workflow(int(parts[1])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "workflows" and parts[2] == "cancel":
+                return Response(200, self.service.cancel_workflow(self._actor(normalized_headers), int(parts[1])))
+            if method == "POST" and path == "/shards/claim":
+                result = self.service.claim_shard(
+                    payload["worker_id"],
+                    payload.get("workflow_id"),
+                    lease_seconds=(None if payload.get("lease_seconds") is None else int(payload["lease_seconds"])),
+                )
+                return Response(200, {"shard": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "shards" and parts[2] == "complete":
+                result = self.service.complete_shard(
+                    payload["worker_id"],
+                    int(parts[1]),
+                    int(payload["generation"]),
+                    self._actor(normalized_headers),
+                    payload.get("output_sha256"),
                 )
                 return Response(200, result)
-            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
-                result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+            if method == "POST" and len(parts) == 3 and parts[0] == "shards" and parts[2] == "fail":
+                result = self.service.fail_shard(
+                    payload["worker_id"],
+                    int(parts[1]),
+                    int(payload["generation"]),
+                    payload["error"],
+                    retryable=bool(payload.get("retryable", True)),
+                    retry_seconds=(None if payload.get("retry_seconds") is None else int(payload["retry_seconds"])),
                 )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "shards" and parts[2] == "resume":
+                result = self.service.resume_manual_shard(self._actor(normalized_headers), int(parts[1]))
                 return Response(200, result)
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(

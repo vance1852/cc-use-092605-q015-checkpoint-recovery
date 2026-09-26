@@ -62,24 +62,52 @@ def _metric_result(metric: Metric, values: list[Decimal], seed: int, samples: in
 def analyze(protocol: Protocol, observations: Iterable[Observation]) -> dict[str, object]:
     all_observations = tuple(observations)
     included = tuple(item for item in all_observations if item.excluded_reason is None)
-    strata: dict[str, dict[str, object]] = {}
+    excluded_count = len(all_observations) - len(included)
+    strata = {
+        stratum.key: stratum_output(protocol, stratum_index, included)
+        for stratum_index, stratum in enumerate(protocol.strata)
+    }
+    result = aggregate_output(protocol, strata)
+    result["excluded_count"] = excluded_count
+    return result
+
+
+def stratum_output(
+    protocol: Protocol, stratum_index: int, included_observations: Iterable[Observation]
+) -> dict[str, object]:
+    """计算单个分层（工作图的叶子分片）的确定性结果。"""
+
+    stratum = protocol.strata[stratum_index]
+    rows = [item for item in included_observations if item.stratum_key == stratum.key]
+    coverage = {"actual": len(rows), "required": stratum.required_trials, "complete": len(rows) >= stratum.required_trials}
+    metrics: dict[str, object] = {}
+    for metric_index, metric in enumerate(protocol.metrics):
+        values = [item.metrics[metric.key] for item in rows]
+        if values:
+            metrics[metric.key] = _metric_result(
+                metric,
+                values,
+                protocol.seed + stratum_index * 1009 + metric_index,
+                protocol.bootstrap_samples,
+            )
+    return {"key": stratum.key, "coverage": coverage, "metrics": metrics}
+
+
+def aggregate_output(
+    protocol: Protocol, strata: Mapping[str, dict[str, object]]
+) -> dict[str, object]:
+    """把各叶子分片的分层结果合并为最终准入结论（聚合分片）。"""
+
     insufficient: list[dict[str, object]] = []
-    for stratum_index, stratum in enumerate(protocol.strata):
-        rows = [item for item in included if item.stratum_key == stratum.key]
-        coverage = {"actual": len(rows), "required": stratum.required_trials, "complete": len(rows) >= stratum.required_trials}
+    for stratum in protocol.strata:
+        coverage = strata[stratum.key]["coverage"]
         if not coverage["complete"]:
-            insufficient.append({"stratum": stratum.key, **coverage})
-        metrics: dict[str, object] = {}
-        for metric_index, metric in enumerate(protocol.metrics):
-            values = [item.metrics[metric.key] for item in rows]
-            if values:
-                metrics[metric.key] = _metric_result(
-                    metric,
-                    values,
-                    protocol.seed + stratum_index * 1009 + metric_index,
-                    protocol.bootstrap_samples,
-                )
-        strata[stratum.key] = {"coverage": coverage, "metrics": metrics}
+            insufficient.append({
+                "stratum": stratum.key,
+                "actual": coverage["actual"],
+                "required": coverage["required"],
+                "complete": coverage["complete"],
+            })
 
     aggregate: dict[str, object] = {}
     for metric in protocol.metrics:
@@ -136,9 +164,11 @@ def analyze(protocol: Protocol, observations: Iterable[Observation]) -> dict[str
         "algorithm_version": ALGORITHM_VERSION,
         "seed": protocol.seed,
         "bootstrap_samples": protocol.bootstrap_samples,
-        "included_count": len(included),
-        "excluded_count": len(all_observations) - len(included),
-        "strata": strata,
+        "included_count": sum(
+            int(strata[stratum.key]["coverage"]["actual"]) for stratum in protocol.strata
+        ),
+        "excluded_count": 0,
+        "strata": {key: {"coverage": value["coverage"], "metrics": value["metrics"]} for key, value in strata.items()},
         "aggregate": aggregate,
         "rules": rule_results,
         "insufficient": insufficient,

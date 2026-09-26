@@ -38,10 +38,27 @@ def run(workspace: Path) -> dict[str, object]:
                 "operator-1", "batch-demo", "demo-import-1", observation_rows
             )
             service.seal_batch("stat-1", "batch-demo", 2)
-            job = service.claim_job("worker-1", lease_seconds=60)
-            if job is None:
-                raise RuntimeError("未能领取分析任务")
-            analysis = service.complete_job("worker-1", job["job_id"], "stat-1")
+            workflow = service.create_analysis_workflow("stat-1", "batch-demo")
+            workflow_id = workflow["workflow_id"]
+            # 工作进程循环领取依赖已满足的分片，直到聚合分片完成。
+            guard = 0
+            analysis = None
+            while True:
+                ticket = service.claim_shard("worker-1", workflow_id, lease_seconds=60)
+                if ticket is None:
+                    break
+                guard += 1
+                if guard > 100:
+                    raise RuntimeError("工作图分片领取次数异常")
+                service.complete_shard(
+                    "worker-1", ticket["shard_id"], ticket["generation"], "stat-1"
+                )
+                if ticket["shard_kind"] == "aggregate":
+                    rebuilt = service.get_workflow(workflow_id)
+                    analysis = rebuilt["analysis"]
+                    break
+            if analysis is None:
+                raise RuntimeError("聚合分片未能完成")
             decision_value = "approved" if analysis["result"]["conclusion"] == "pass" else "rejected"
             service.decide(
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
@@ -50,15 +67,17 @@ def run(workspace: Path) -> dict[str, object]:
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",
         "protocol": f"{protocol['protocol_id']}@{protocol['version']}",
         "observation_count": imported["inserted"],
+        "workflow_id": workflow_id,
         "analysis_id": analysis["analysis_id"],
         "input_sha256": analysis["input_sha256"],
         "conclusion": analysis["result"]["conclusion"],
+        "provenance_count": len(analysis["provenance"]),
         "decision": report["decision"]["decision"],
         "event_count": len(report["events"]),
         "schema": schema,
