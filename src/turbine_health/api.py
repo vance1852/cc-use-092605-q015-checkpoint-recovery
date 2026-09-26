@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from .errors import ServiceError, ValidationFailed
 from .service import TrialService
 from .storage import connect
+from .workgraph import WorkGraphService
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,8 +26,9 @@ class Response:
 class JsonApplication:
     """将 HTTP 路由映射到领域服务，便于无网络单元测试。"""
 
-    def __init__(self, service: TrialService) -> None:
+    def __init__(self, service: TrialService, workgraph: WorkGraphService | None = None) -> None:
         self.service = service
+        self.workgraph = workgraph or WorkGraphService(service.connection)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -133,6 +135,46 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            if method == "POST" and path == "/analysis-tasks":
+                result = self.workgraph.create_task(
+                    self._actor(normalized_headers), payload["task_id"], payload["title"],
+                    payload["algorithm_version"], payload.get("shards", []), payload.get("policy"),
+                )
+                return Response(201, result)
+            if method == "GET" and len(parts) == 2 and parts[0] == "analysis-tasks":
+                return Response(200, self.workgraph.task_status(self._actor(normalized_headers), parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "analysis-tasks" and parts[2] == "cancel":
+                result = self.workgraph.cancel_task(self._actor(normalized_headers), parts[1])
+                return Response(200, result)
+            if (
+                method == "POST" and len(parts) == 5 and parts[0] == "analysis-tasks"
+                and parts[2] == "shards" and parts[4] == "requeue"
+            ):
+                result = self.workgraph.requeue_shard(self._actor(normalized_headers), parts[1], parts[3])
+                return Response(200, result)
+            if (
+                method == "POST" and len(parts) == 5 and parts[0] == "analysis-tasks"
+                and parts[2] == "shards" and parts[4] == "complete"
+            ):
+                result = self.workgraph.complete_shard(
+                    payload["worker_id"], parts[1], parts[3], int(payload["generation"]),
+                    payload["algorithm_version"], payload["input_sha256"], payload["output"],
+                )
+                return Response(200, result)
+            if (
+                method == "POST" and len(parts) == 5 and parts[0] == "analysis-tasks"
+                and parts[2] == "shards" and parts[4] == "fail"
+            ):
+                result = self.workgraph.fail_shard(
+                    payload["worker_id"], parts[1], parts[3], int(payload["generation"]),
+                    payload["error"], bool(payload.get("retryable", True)),
+                )
+                return Response(200, result)
+            if method == "POST" and path == "/analysis-shards/claim":
+                result = self.workgraph.claim_shard(
+                    payload["worker_id"], int(payload.get("lease_seconds", 60)), payload.get("task_id")
+                )
+                return Response(200, {"claim": result})
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
@@ -174,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    application = JsonApplication(TrialService(connection))
+    application = JsonApplication(TrialService(connection), WorkGraphService(connection))
     server = ThreadingHTTPServer((args.host, args.port), make_handler(application))
     try:
         server.serve_forever()

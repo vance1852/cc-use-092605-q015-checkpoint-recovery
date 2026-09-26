@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -157,12 +157,86 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS analysis_tasks (
+    task_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    retry_delay_seconds INTEGER NOT NULL CHECK (retry_delay_seconds >= 0),
+    state TEXT NOT NULL CHECK (state IN ('open', 'cancelled')),
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    cancelled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_shards (
+    task_id TEXT NOT NULL REFERENCES analysis_tasks(task_id),
+    shard_key TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+    state TEXT NOT NULL CHECK (state IN ('waiting', 'running', 'failed', 'manual', 'complete')),
+    claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (claim_generation >= 0),
+    attempt_base INTEGER NOT NULL DEFAULT 0 CHECK (attempt_base >= 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, shard_key)
+);
+
+CREATE TABLE IF NOT EXISTS shard_dependencies (
+    task_id TEXT NOT NULL,
+    shard_key TEXT NOT NULL,
+    depends_on_key TEXT NOT NULL,
+    PRIMARY KEY (task_id, shard_key, depends_on_key),
+    FOREIGN KEY (task_id, shard_key) REFERENCES task_shards(task_id, shard_key),
+    FOREIGN KEY (task_id, depends_on_key) REFERENCES task_shards(task_id, shard_key)
+);
+
+CREATE TABLE IF NOT EXISTS shard_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    shard_key TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    worker_id TEXT NOT NULL,
+    leased_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN ('leased', 'succeeded', 'failed_retryable', 'failed_final')),
+    error TEXT,
+    input_sha256 TEXT,
+    output_sha256 TEXT,
+    FOREIGN KEY (task_id, shard_key) REFERENCES task_shards(task_id, shard_key)
+);
+
+CREATE INDEX IF NOT EXISTS shard_attempts_by_shard
+ON shard_attempts(task_id, shard_key, attempt_no);
+
+CREATE TABLE IF NOT EXISTS shard_outputs (
+    task_id TEXT NOT NULL,
+    shard_key TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+    algorithm_version TEXT NOT NULL,
+    output_json TEXT NOT NULL,
+    output_sha256 TEXT NOT NULL CHECK (length(output_sha256) = 64),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    worker_id TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, shard_key),
+    FOREIGN KEY (task_id, shard_key) REFERENCES task_shards(task_id, shard_key)
+);
 """
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "analyses", "decisions", "audit_events", "analysis_tasks", "task_shards",
+    "shard_dependencies", "shard_attempts", "shard_outputs",
 })
 
 

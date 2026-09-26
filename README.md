@@ -5,7 +5,7 @@
 ## 目录
 
 - `src/wind_dispatch/`：场站、送出通道、机组可用量、功率申报、日前分配和调度情景；
-- `src/turbine_health/`：机组健康协议、测点导入、异常复核、分析任务租约和健康决定；
+- `src/turbine_health/`：机组健康协议、测点导入、异常复核、分析任务租约、可恢复分片工作图和健康决定；
 - `src/grid_qualification/`：并网机组批次、检测数据、分析、账号登录与质量审批；
 - `fixtures/`：离线验收使用的检测协议和结构化测点；
 - `tests/`：核心规则、权限、错误边界、事务、API 和命令行验收测试。
@@ -47,3 +47,13 @@ PYTHONPATH=src python3 -m grid_qualification.api --database grid.sqlite3 --host 
 ```
 
 服务均提供 `GET /health`，其余接口使用 JSON。账号登录和角色权限由服务端校验，进程重启后可以继续查询 SQLite 中的业务状态与审计历史。
+
+## 可恢复分析工作图
+
+`turbine_health` 的分片工作图把批量分析（如 131 台机组遥测校核加下游功率曲线统计）改造成可恢复执行：
+
+- 创建任务（`POST /analysis-tasks`）时固定输入清单摘要与算法版本，每个分片记录前置依赖；
+- 工作进程凭限时租约领取（`POST /analysis-shards/claim`）依赖已完成的分片，每次领取递增领取代次；
+- 提交（`POST /analysis-tasks/{task}/shards/{shard}/complete`）把结果入库与下游解锁放在同一事务，并重新核对领取代次、输入摘要与算法版本；租约失效后的迟到提交会被拒绝且不影响接管者；
+- 可重试错误按任务策略退避重试，超过限额转人工处理（`POST .../requeue` 重新入队）；取消任务只阻止新的领取，已有成果保留；
+- `GET /analysis-tasks/{task}` 从持久化记录重建等待、运行、失败、人工处理和完成状态，并给出每个输出由哪份输入与哪次尝试产生。

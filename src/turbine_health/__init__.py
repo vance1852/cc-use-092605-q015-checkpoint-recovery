@@ -4,6 +4,7 @@ from .contracts import Observation, Protocol, ValidationError
 from .analysis import ALGORITHM_VERSION, analyze, bootstrap_mean_interval
 from .numeric import NumericSummary, WilsonInterval
 from .service import TrialService
+from .workgraph import WorkGraphService
 
 __all__ = [
     "NumericSummary",
@@ -13,6 +14,7 @@ __all__ = [
     "WilsonInterval",
     "ALGORITHM_VERSION",
     "TrialService",
+    "WorkGraphService",
     "analyze",
     "bootstrap_mean_interval",
 ]
